@@ -19,7 +19,7 @@ variable "law_name" {
 variable "storage_name" {
   description = "Storage account (globally unique, 3-24 lowercase letters/numbers)"
   type        = string
-  default     = "stnsgflowlogsauto123" # CHANGE if already taken
+  default     = "stnsgflowlogsauto123" # change if taken
 }
 
 variable "nsg_name" {
@@ -34,21 +34,21 @@ variable "logic_app_name" {
   default     = "la-nsg-autofix"
 }
 
+variable "automation_account_name" {
+  description = "Automation Account name"
+  type        = string
+  default     = "aa-nsg-autofix"
+}
+
 variable "protect_ports" {
-  description = "Ports to protect from 0.0.0.0/0"
+  description = "Ports to protect from 0.0.0.0/0 (used by policy if enabled)"
   type        = list(string)
   default     = ["22", "3389"]
 }
 
-# --- Feature flags to avoid RBAC errors while you wait for permissions ---
+# Feature flag: create deny policy (optional)
 variable "enable_policy" {
-  description = "Create custom policy definition + assignment (requires Resource Policy Contributor)"
-  type        = bool
-  default     = false
-}
-
-variable "enable_role_assignments" {
-  description = "Create RBAC role assignments (requires User Access Administrator)"
+  description = "Create custom policy definition + assignment (requires Resource Policy Contributor/Owner)"
   type        = bool
   default     = false
 }
