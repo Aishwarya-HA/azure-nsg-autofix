@@ -46,7 +46,7 @@ variable "protect_ports" {
   default     = ["22", "3389"]
 }
 
-# Feature flag: create deny policy (optional)
+# Optional policy (flip to true when you have Policy permissions)
 variable "enable_policy" {
   description = "Create custom policy definition + assignment (requires Resource Policy Contributor/Owner)"
   type        = bool
