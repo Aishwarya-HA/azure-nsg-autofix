@@ -39,3 +39,16 @@ variable "protect_ports" {
   type        = list(string)
   default     = ["22", "3389"]
 }
+
+# --- Feature flags to avoid RBAC errors while you wait for permissions ---
+variable "enable_policy" {
+  description = "Create custom policy definition + assignment (requires Resource Policy Contributor)"
+  type        = bool
+  default     = false
+}
+
+variable "enable_role_assignments" {
+  description = "Create RBAC role assignments (requires User Access Administrator)"
+  type        = bool
+  default     = false
+}
