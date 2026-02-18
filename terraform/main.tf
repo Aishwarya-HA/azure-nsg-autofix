@@ -44,7 +44,7 @@ resource "azurerm_storage_account" "sa" {
 }
 
 # -----------------------------
-# Sample NSG (intentionally unsafe rule to demonstrate auto-fix later)
+# Sample NSG (intentionally unsafe rule to demo auto-fix later)
 # -----------------------------
 resource "azurerm_network_security_group" "nsg" {
   name                = var.nsg_name
@@ -66,8 +66,15 @@ resource "azurerm_network_security_group" "nsg" {
 }
 
 # -----------------------------
-# Network Watcher + Flow Logs v2 + Traffic Analytics
+# VNet + VNet Flow Logs (NSG Flow Logs are blocked after Jun 30, 2025)
 # -----------------------------
+resource "azurerm_virtual_network" "vnet" {
+  name                = "vnet-sec-auto"
+  address_space       = ["10.10.0.0/16"]
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
 resource "azurerm_network_watcher" "nw" {
   name                = "nw-${var.location}"
   location            = var.location
@@ -75,13 +82,15 @@ resource "azurerm_network_watcher" "nw" {
 }
 
 resource "azurerm_network_watcher_flow_log" "flowlog" {
-  name                      = "flowlog-${var.nsg_name}"
-  resource_group_name       = azurerm_resource_group.rg.name
-  network_watcher_name      = azurerm_network_watcher.nw.name
-  network_security_group_id = azurerm_network_security_group.nsg.id
-  storage_account_id        = azurerm_storage_account.sa.id
-  enabled                   = true
-  version                   = 2
+  name                 = "flowlog-vnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  network_watcher_name = azurerm_network_watcher.nw.name
+
+  # VNet Flow Logs: target the VNet (NOT the NSG)
+  target_resource_id  = azurerm_virtual_network.vnet.id
+  storage_account_id  = azurerm_storage_account.sa.id
+  enabled             = true
+  version             = 2
 
   retention_policy {
     enabled = true
@@ -98,9 +107,10 @@ resource "azurerm_network_watcher_flow_log" "flowlog" {
 }
 
 # -----------------------------
-# Azure Policy: Deny 0.0.0.0/0 on protected ports (22,3389)
+# Azure Policy: (gated until you have the right permissions)
 # -----------------------------
 resource "azurerm_policy_definition" "deny_any_protected_ports" {
+  count        = var.enable_policy ? 1 : 0
   name         = "deny-any-protected-ports"
   policy_type  = "Custom"
   mode         = "All"
@@ -137,12 +147,12 @@ resource "azurerm_policy_definition" "deny_any_protected_ports" {
   })
 }
 
-# ✅ v4-style: assign the policy at RG scope
 resource "azurerm_resource_group_policy_assignment" "deny_any_protected_ports_assignment" {
-  name                 = "deny-any-protected-ports-assignment"
-  display_name         = "Deny inbound any on protected ports"
-  resource_group_id    = azurerm_resource_group.rg.id
-  policy_definition_id = azurerm_policy_definition.deny_any_protected_ports.id
+  count               = var.enable_policy ? 1 : 0
+  name                = "deny-any-protected-ports-assignment"
+  display_name        = "Deny inbound any on protected ports"
+  resource_group_id   = azurerm_resource_group.rg.id
+  policy_definition_id = azurerm_policy_definition.deny_any_protected_ports[0].id
 
   parameters = jsonencode({
     ports = { value = var.protect_ports }
@@ -173,7 +183,7 @@ resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
       subscriptionId    = { type = "string" },
       resourceGroupName = { type = "string" },
       nsgName           = { type = "string" },
-      actionType        = { type = "string" }, # "ClosePort" | "BlockIP" (for future)
+      actionType        = { type = "string" }, # "ClosePort" | "BlockIP" (future use)
       port              = { type = "string" },
       protocol          = { type = "string" },
       maliciousIpCidr   = { type = "string" }
@@ -182,9 +192,7 @@ resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
   })
 }
 
-# ---- Logic App Actions as CUSTOM so we can embed JSON, runAfter, and MSI auth ----
-
-# 1) GET the NSG
+# Actions as CUSTOM (no MSI auth yet; we'll add later)
 resource "azurerm_logic_app_action_custom" "get_nsg" {
   name         = "Get_NSG"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
@@ -193,16 +201,11 @@ resource "azurerm_logic_app_action_custom" "get_nsg" {
     "type"   : "Http",
     "inputs" : {
       "method": "GET",
-      "uri"   : "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}",
-      "authentication": {
-        "type": "ManagedServiceIdentity"
-      }
+      "uri"   : "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}"
     }
   })
 }
 
-# 2) PUT the NSG back (round-trip) — proves MSI + permissions.
-#    We'll add the real rule-fix logic in the next step.
 resource "azurerm_logic_app_action_custom" "put_nsg" {
   name         = "Put_NSG"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
@@ -212,30 +215,22 @@ resource "azurerm_logic_app_action_custom" "put_nsg" {
     "inputs" : {
       "method": "PUT",
       "uri"   : "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}",
-      "headers": {
-        "Content-Type": "application/json"
-      },
-      "body": "@{body('Get_NSG')}",
-      "authentication": {
-        "type": "ManagedServiceIdentity"
-      }
+      "headers": { "Content-Type": "application/json" },
+      "body"   : "@{body('Get_NSG')}"
     },
-    "runAfter": {
-      "Get_NSG": ["Succeeded"]
-    }
+    "runAfter": { "Get_NSG": ["Succeeded"] }
   })
 }
 
-# Allow Logic App MI to manage the NSG
+# RBAC for Logic App MI (gated until you have 'User Access Administrator')
 resource "azurerm_role_assignment" "logic_nsg_access" {
-  principal_id         = azurerm_logic_app_workflow.autofix.identity[0].principal_id
+  count               = var.enable_role_assignments ? 1 : 0
+  principal_id        = azurerm_logic_app_workflow.autofix.identity[0].principal_id
   role_definition_name = "Network Contributor"
-  scope                = azurerm_network_security_group.nsg.id
+  scope               = azurerm_network_security_group.nsg.id
 }
 
-# -----------------------------
-# Action Group -> webhook to Logic App trigger URL (ready for alerts later)
-# -----------------------------
+# Action Group -> webhook to Logic App trigger URL
 resource "azurerm_monitor_action_group" "ag" {
   name                = "ag-nsg-autofix"
   resource_group_name = azurerm_resource_group.rg.name
