@@ -66,7 +66,7 @@ resource "azurerm_network_security_group" "nsg" {
 }
 
 # -------------------------------------------------------------------
-# VNet + VNet Flow Logs (NSG Flow Logs: new creation blocked; use VNet)
+# VNet + VNet Flow Logs (NSG Flow Logs new creation is blocked; use VNet)
 # -------------------------------------------------------------------
 resource "azurerm_virtual_network" "vnet" {
   name                = "vnet-sec-auto"
@@ -167,7 +167,6 @@ resource "azurerm_logic_app_workflow" "autofix" {
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
 
-  # Identity not required now (we call a signed webhook), but keeping is fine
   identity {
     type = "SystemAssigned"
   }
@@ -192,14 +191,13 @@ resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
     required = ["subscriptionId","resourceGroupName","nsgName","actionType"]
   })
 
-  # Ensure a POST URL is emitted and visible in designer
   method        = "POST"
   relative_path = "invoke"
 }
 
 # -------------------------------------------------------------------
 # Automation Account + Runbook + Webhook
-# Runbook inserts an inbound Deny rule on the specified port if not already present
+# Runbook inserts an inbound Deny rule on the specified port if not present
 # -------------------------------------------------------------------
 resource "azurerm_automation_account" "aa" {
   name                = var.automation_account_name
@@ -219,7 +217,7 @@ resource "azurerm_role_assignment" "aa_nsg_access" {
   principal_id         = azurerm_automation_account.aa.identity[0].principal_id
 }
 
-# PowerShell runbook that inserts Deny rule if needed
+# PowerShell runbook: **proper indented heredoc** (closing PS1 at column 0)
 resource "azurerm_automation_runbook" "rb_nsg_autofix" {
   name                    = "rb-nsg-autofix"
   location                = azurerm_resource_group.rg.location
@@ -230,7 +228,7 @@ resource "azurerm_automation_runbook" "rb_nsg_autofix" {
   log_progress            = true
   description             = "Add a high-priority inbound Deny rule for the specified port from Internet if not present."
 
-  content = <<'PS1'
+  content = <<-PS1
 param(
     [Parameter(Mandatory = $false)]
     [object]$WebhookData
@@ -308,9 +306,7 @@ resource "azurerm_automation_webhook" "rb_webhook" {
   expiry_time             = timeadd(timestamp(), "8760h")
 }
 
-# -------------------------------------------------------------------
 # Logic App action: call the runbook webhook with the original payload
-# -------------------------------------------------------------------
 resource "azurerm_logic_app_action_custom" "call_autofix_webhook" {
   name         = "Call_AutoFix_Runbook"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
