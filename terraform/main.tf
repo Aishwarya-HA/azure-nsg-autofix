@@ -44,7 +44,7 @@ resource "azurerm_storage_account" "sa" {
 }
 
 # -------------------------------------------------------------------
-# Sample NSG (intentionally unsafe rule to demonstrate auto-fix later)
+# Sample NSG (intentionally unsafe inbound RDP to demo auto-fix)
 # -------------------------------------------------------------------
 resource "azurerm_network_security_group" "nsg" {
   name                = var.nsg_name
@@ -61,12 +61,12 @@ resource "azurerm_network_security_group" "nsg" {
     destination_port_range     = "3389"
     source_address_prefix      = "0.0.0.0/0"
     destination_address_prefix = "*"
-    description                = "Deliberately open for demo; Logic App will fix"
+    description                = "Deliberately open for demo; automation will fix"
   }
 }
 
 # -------------------------------------------------------------------
-# VNet + VNet Flow Logs (NSG Flow Logs: new creation blocked; move to VNet)
+# VNet + VNet Flow Logs (NSG Flow Logs: new creation blocked; use VNet)
 # -------------------------------------------------------------------
 resource "azurerm_virtual_network" "vnet" {
   name                = "vnet-sec-auto"
@@ -86,7 +86,7 @@ resource "azurerm_network_watcher_flow_log" "flowlog" {
   resource_group_name  = azurerm_resource_group.rg.name
   network_watcher_name = azurerm_network_watcher.nw.name
 
-  # VNet Flow Logs: target the VNet (NOT the NSG)
+  # VNet Flow Logs: scope at VNet (supported path)
   target_resource_id = azurerm_virtual_network.vnet.id
   storage_account_id = azurerm_storage_account.sa.id
   enabled            = true
@@ -107,7 +107,7 @@ resource "azurerm_network_watcher_flow_log" "flowlog" {
 }
 
 # -------------------------------------------------------------------
-# Azure Policy (DENY 0.0.0.0/0 for protected ports) - gated by feature flag
+# Optional: Azure Policy to deny 0.0.0.0/0 on protected ports
 # -------------------------------------------------------------------
 resource "azurerm_policy_definition" "deny_any_protected_ports" {
   count        = var.enable_policy ? 1 : 0
@@ -147,7 +147,6 @@ resource "azurerm_policy_definition" "deny_any_protected_ports" {
   })
 }
 
-# v4-style RG-scoped assignment
 resource "azurerm_resource_group_policy_assignment" "deny_any_protected_ports_assignment" {
   count                 = var.enable_policy ? 1 : 0
   name                  = "deny-any-protected-ports-assignment"
@@ -161,31 +160,31 @@ resource "azurerm_resource_group_policy_assignment" "deny_any_protected_ports_as
 }
 
 # -------------------------------------------------------------------
-# Logic App (Consumption) with System-assigned Managed Identity
+# Logic App (Consumption) with Request trigger
 # -------------------------------------------------------------------
 resource "azurerm_logic_app_workflow" "autofix" {
   name                = var.logic_app_name
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
 
+  # Identity not required now (we call a signed webhook), but keeping is fine
   identity {
     type = "SystemAssigned"
   }
 }
 
-# ---- HTTP Request trigger so Azure generates the POST callback URL ----
+# HTTP Request trigger -> Azure will generate a callback URL
 resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
   name         = "manual"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
 
-  # Expected request body schema
   schema = jsonencode({
     type       = "object",
     properties = {
       subscriptionId    = { type = "string" },
       resourceGroupName = { type = "string" },
       nsgName           = { type = "string" },
-      actionType        = { type = "string" },  # "ClosePort" | "BlockIP" (future)
+      actionType        = { type = "string" },  # "ClosePort" | "BlockIP" (future use)
       port              = { type = "string" },
       protocol          = { type = "string" },
       maliciousIpCidr   = { type = "string" }
@@ -193,64 +192,145 @@ resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
     required = ["subscriptionId","resourceGroupName","nsgName","actionType"]
   })
 
+  # Ensure a POST URL is emitted and visible in designer
   method        = "POST"
   relative_path = "invoke"
 }
 
-# ---- Action 1: GET the NSG (custom action with MSI auth in JSON) ----
-resource "azurerm_logic_app_action_custom" "get_nsg" {
-  name         = "Get_NSG"
-  logic_app_id = azurerm_logic_app_workflow.autofix.id
+# -------------------------------------------------------------------
+# Automation Account + Runbook + Webhook
+# Runbook inserts an inbound Deny rule on the specified port if not already present
+# -------------------------------------------------------------------
+resource "azurerm_automation_account" "aa" {
+  name                = var.automation_account_name
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  sku_name            = "Basic"
 
-  body = jsonencode({
-    "type"   : "Http",
-    "inputs" : {
-      "method": "GET",
-      "uri"   : "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}",
-      "authentication": { "type": "ManagedServiceIdentity" }
-    }
-  })
+  identity {
+    type = "SystemAssigned"
+  }
 }
 
-# ---- Action 2: PUT the NSG back (ensure it runs after Get_NSG) ----
-resource "azurerm_logic_app_action_custom" "put_nsg" {
-  name         = "Put_NSG"
+# Give Automation Account permission to modify the NSG
+resource "azurerm_role_assignment" "aa_nsg_access" {
+  scope                = azurerm_network_security_group.nsg.id
+  role_definition_name = "Network Contributor"
+  principal_id         = azurerm_automation_account.aa.identity[0].principal_id
+}
+
+# PowerShell runbook that inserts Deny rule if needed
+resource "azurerm_automation_runbook" "rb_nsg_autofix" {
+  name                    = "rb-nsg-autofix"
+  location                = azurerm_resource_group.rg.location
+  resource_group_name     = azurerm_resource_group.rg.name
+  automation_account_name = azurerm_automation_account.aa.name
+  runbook_type            = "PowerShell"
+  log_verbose             = true
+  log_progress            = true
+  description             = "Add a high-priority inbound Deny rule for the specified port from Internet if not present."
+
+  content = <<'PS1'
+param(
+    [Parameter(Mandatory = $false)]
+    [object]$WebhookData
+)
+
+if (-not $WebhookData -or -not $WebhookData.RequestBody) {
+    throw "No WebhookData.RequestBody found."
+}
+$payload = $WebhookData.RequestBody | ConvertFrom-Json
+
+$SubscriptionId     = $payload.subscriptionId
+$ResourceGroupName  = $payload.resourceGroupName
+$NsgName            = $payload.nsgName
+$Port               = [int]$payload.port
+
+Write-Output "Starting NSG autofix on $NsgName (RG=$ResourceGroupName, Port=$Port)"
+
+# Authenticate as Automation Account's Managed Identity
+Connect-AzAccount -Identity | Out-Null
+Select-AzSubscription -SubscriptionId $SubscriptionId | Out-Null
+
+# Get NSG
+$nsg = Get-AzNetworkSecurityGroup -Name $NsgName -ResourceGroupName $ResourceGroupName -ErrorAction Stop
+
+# Check for existing broad Deny on the port
+$existingDeny = $nsg.SecurityRules | Where-Object {
+    $_.Direction -eq "Inbound" -and
+    $_.Access -eq "Deny" -and
+    ($_.DestinationPortRange -eq "$Port" -or ($_.DestinationPortRanges -and ($_.DestinationPortRanges -contains "$Port"))) -and
+    ($_.SourceAddressPrefix -in @("0.0.0.0/0","*","Internet") -or ($_.SourceAddressPrefixes -and ($_.SourceAddressPrefixes | Where-Object { $_ -in @("0.0.0.0/0","*","Internet") })))
+}
+if ($existingDeny) {
+    Write-Output "An appropriate Deny rule for port $Port already exists. Exiting."
+    return
+}
+
+# Choose a priority, prefer 200; find next available if occupied
+$used = @($nsg.SecurityRules | Select-Object -ExpandProperty Priority)
+$priority = 200
+while ($used -contains $priority) {
+    $priority++
+    if ($priority -gt 4096) { throw "No free priority available in NSG." }
+}
+
+$ruleName = "AutoFix-Deny-Port$Port"
+Write-Output "Adding Deny rule $ruleName at priority $priority"
+
+# Add new inbound Deny rule
+$nsg | Add-AzNetworkSecurityRuleConfig `
+    -Name $ruleName `
+    -Description "AutoFix: deny inbound port $Port from Internet" `
+    -Access Deny `
+    -Protocol Tcp `
+    -Direction Inbound `
+    -Priority $priority `
+    -SourceAddressPrefix "0.0.0.0/0" `
+    -SourcePortRange "*" `
+    -DestinationAddressPrefix "*" `
+    -DestinationPortRange "$Port" | Out-Null
+
+Set-AzNetworkSecurityGroup -NetworkSecurityGroup $nsg | Out-Null
+Write-Output "Completed: added $ruleName."
+PS1
+}
+
+# Signed webhook URL so Logic App can invoke the runbook
+resource "azurerm_automation_webhook" "rb_webhook" {
+  name                    = "wh-nsg-autofix"
+  resource_group_name     = azurerm_resource_group.rg.name
+  automation_account_name = azurerm_automation_account.aa.name
+  runbook_name            = azurerm_automation_runbook.rb_nsg_autofix.name
+  is_enabled              = true
+
+  # 1 year from now; rotate as needed
+  expiry_time             = timeadd(timestamp(), "8760h")
+}
+
+# -------------------------------------------------------------------
+# Logic App action: call the runbook webhook with the original payload
+# -------------------------------------------------------------------
+resource "azurerm_logic_app_action_custom" "call_autofix_webhook" {
+  name         = "Call_AutoFix_Runbook"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
 
-  # Ensure Get_NSG is created first (Azure validates runAfter target exists)
   depends_on = [
-    azurerm_logic_app_action_custom.get_nsg
+    azurerm_automation_webhook.rb_webhook
   ]
 
   body = jsonencode({
-    "type"   : "Http",
-    "inputs" : {
-      "method": "PUT",
-      "uri"   : "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}",
-      "headers": { "Content-Type": "application/json" },
-      "body"   : "@{body('Get_NSG')}",
-      "authentication": { "type": "ManagedServiceIdentity" }
+    "type": "Http",
+    "inputs": {
+      "method": "POST",
+      "uri": "${azurerm_automation_webhook.rb_webhook.uri}",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "@{triggerBody()}"
     },
-    "runAfter": { "Get_NSG": ["Succeeded"] }
+    "runAfter": {
+      "manual": ["Succeeded"]
+    }
   })
-}
-
-# ---- RBAC for Logic App MI on NSG (gated until you have permissions) ----
-resource "azurerm_role_assignment" "logic_nsg_access" {
-  count                 = var.enable_role_assignments ? 1 : 0
-  principal_id          = azurerm_logic_app_workflow.autofix.identity[0].principal_id
-  role_definition_name  = "Network Contributor"
-  scope                 = azurerm_network_security_group.nsg.id
-}
-
-# ---- Action Group -> webhook to Logic App trigger URL (for alerts later) ----
-resource "azurerm_monitor_action_group" "ag" {
-  name                = "ag-nsg-autofix"
-  resource_group_name = azurerm_resource_group.rg.name
-  short_name          = "autofix"
-
-  webhook_receiver {
-    name        = "logicapp"
-    service_uri = azurerm_logic_app_trigger_http_request.la_trigger.callback_url
-  }
 }
