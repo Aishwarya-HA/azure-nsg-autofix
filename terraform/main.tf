@@ -300,10 +300,15 @@ resource "azurerm_automation_webhook" "rb_webhook" {
   resource_group_name     = azurerm_resource_group.rg.name
   automation_account_name = azurerm_automation_account.aa.name
   runbook_name            = azurerm_automation_runbook.rb_nsg_autofix.name
-  is_enabled              = true
 
-  # 1 year from now; rotate as needed
-  expiry_time             = timeadd(timestamp(), "8760h")
+  # RFC3339 timestamp; using timeadd to set ~1 year from now
+  expiry_time = timeadd(timestamp(), "8760h")
+
+  # Correct attribute name (NOT is_enabled)
+  enabled = true
+
+  # No parameters required; runbook reads WebhookData.RequestBody
+  parameters = {}
 }
 
 # Logic App action: call the runbook webhook with the original payload
@@ -324,9 +329,7 @@ resource "azurerm_logic_app_action_custom" "call_autofix_webhook" {
         "Content-Type": "application/json"
       },
       "body": "@{triggerBody()}"
-    },
-    "runAfter": {
-      "manual": ["Succeeded"]
     }
+    # No runAfter needed; action runs right after trigger by default
   })
 }
