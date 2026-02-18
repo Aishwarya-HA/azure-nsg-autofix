@@ -17,9 +17,9 @@ variable "law_name" {
 }
 
 variable "storage_name" {
-  description = "Storage account (must be globally unique, 3-24 lowercase letters/numbers)"
+  description = "Storage account (globally unique, 3-24 lowercase letters/numbers)"
   type        = string
-  default     = "stnsgflowlogsauto123" # CHANGE if unavailable
+  default     = "stnsgflowlogsauto123" # CHANGE if already taken
 }
 
 variable "nsg_name" {
@@ -39,4 +39,3 @@ variable "protect_ports" {
   type        = list(string)
   default     = ["22", "3389"]
 }
-
