@@ -66,7 +66,7 @@ resource "azurerm_network_security_group" "nsg" {
 }
 
 # -------------------------------------------------------------------
-# VNet + VNet Flow Logs (NSG Flow Logs are blocked for new creation)
+# VNet + VNet Flow Logs (NSG Flow Logs: new creation blocked; move to VNet)
 # -------------------------------------------------------------------
 resource "azurerm_virtual_network" "vnet" {
   name                = "vnet-sec-auto"
@@ -149,11 +149,12 @@ resource "azurerm_policy_definition" "deny_any_protected_ports" {
 
 # v4-style RG-scoped assignment
 resource "azurerm_resource_group_policy_assignment" "deny_any_protected_ports_assignment" {
-  count                = var.enable_policy ? 1 : 0
-  name                 = "deny-any-protected-ports-assignment"
-  display_name         = "Deny inbound any on protected ports"
-  resource_group_id    = azurerm_resource_group.rg.id
-  policy_definition_id = azurerm_policy_definition.deny_any_protected_ports[0].id
+  count                 = var.enable_policy ? 1 : 0
+  name                  = "deny-any-protected-ports-assignment"
+  display_name          = "Deny inbound any on protected ports"
+  resource_group_id     = azurerm_resource_group.rg.id
+  policy_definition_id  = azurerm_policy_definition.deny_any_protected_ports[0].id
+
   parameters = jsonencode({
     ports = { value = var.protect_ports }
   })
@@ -172,7 +173,7 @@ resource "azurerm_logic_app_workflow" "autofix" {
   }
 }
 
-# ---- FIXED: HTTP Request trigger so Azure generates the POST callback URL ----
+# ---- HTTP Request trigger so Azure generates the POST callback URL ----
 resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
   name         = "manual"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
@@ -192,7 +193,6 @@ resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
     required = ["subscriptionId","resourceGroupName","nsgName","actionType"]
   })
 
-  # Key lines to ensure Azure emits a POST callback URL
   method        = "POST"
   relative_path = "invoke"
 }
@@ -212,10 +212,15 @@ resource "azurerm_logic_app_action_custom" "get_nsg" {
   })
 }
 
-# ---- Action 2: PUT the NSG back (round-trip; we’ll add the 'fix' step next) ----
+# ---- Action 2: PUT the NSG back (ensure it runs after Get_NSG) ----
 resource "azurerm_logic_app_action_custom" "put_nsg" {
   name         = "Put_NSG"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
+
+  # Ensure Get_NSG is created first (Azure validates runAfter target exists)
+  depends_on = [
+    azurerm_logic_app_action_custom.get_nsg
+  ]
 
   body = jsonencode({
     "type"   : "Http",
@@ -232,10 +237,10 @@ resource "azurerm_logic_app_action_custom" "put_nsg" {
 
 # ---- RBAC for Logic App MI on NSG (gated until you have permissions) ----
 resource "azurerm_role_assignment" "logic_nsg_access" {
-  count                = var.enable_role_assignments ? 1 : 0
-  principal_id         = azurerm_logic_app_workflow.autofix.identity[0].principal_id
-  role_definition_name = "Network Contributor"
-  scope                = azurerm_network_security_group.nsg.id
+  count                 = var.enable_role_assignments ? 1 : 0
+  principal_id          = azurerm_logic_app_workflow.autofix.identity[0].principal_id
+  role_definition_name  = "Network Contributor"
+  scope                 = azurerm_network_security_group.nsg.id
 }
 
 # ---- Action Group -> webhook to Logic App trigger URL (for alerts later) ----
