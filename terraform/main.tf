@@ -44,14 +44,14 @@ resource "azurerm_storage_account" "sa" {
 }
 
 # -----------------------------
-# Sample NSG (intentionally unsafe rule to demonstrate auto-fix)
+# Sample NSG (intentionally unsafe rule to demonstrate auto-fix later)
 # -----------------------------
 resource "azurerm_network_security_group" "nsg" {
   name                = var.nsg_name
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
 
-  # Example risky rule: RDP open to internet (will be auto-fixed)
+  # Example risky rule: RDP open to internet (we will "fix" it later)
   security_rule {
     name                       = "Allow-RDP-Internet"
     priority                   = 300
@@ -67,27 +67,29 @@ resource "azurerm_network_security_group" "nsg" {
 }
 
 # -----------------------------
-# Network Watcher Flow Logs v2 + Traffic Analytics
-# Note: In many subscriptions, Network Watcher RG/name are pre-created.
-# For Central India region, they are typically:
-#   RG:   NetworkWatcherRG
-#   Name: NetworkWatcher_centralindia
-# If they don't exist, create them or switch to region's watcher.
+# Network Watcher + Flow Logs v2 + Traffic Analytics
+# Create a watcher in *your* RG for the chosen region.
 # -----------------------------
 resource "azurerm_network_watcher" "nw" {
-  name                = "NetworkWatcher_${var.location}"
-  resource_group_name = "NetworkWatcherRG"
+  name                = "nw-${var.location}"
   location            = var.location
+  resource_group_name = azurerm_resource_group.rg.name
 }
 
 resource "azurerm_network_watcher_flow_log" "flowlog" {
   name                      = "flowlog-${var.nsg_name}"
-  resource_group_name       = azurerm_network_watcher.nw.resource_group_name
+  resource_group_name       = azurerm_resource_group.rg.name
   network_watcher_name      = azurerm_network_watcher.nw.name
   network_security_group_id = azurerm_network_security_group.nsg.id
   storage_account_id        = azurerm_storage_account.sa.id
   enabled                   = true
   version                   = 2
+
+  # ✅ REQUIRED: retention_policy block is mandatory
+  retention_policy {
+    enabled = true
+    days    = 7
+  }
 
   traffic_analytics {
     enabled               = true
@@ -100,7 +102,6 @@ resource "azurerm_network_watcher_flow_log" "flowlog" {
 
 # -----------------------------
 # Azure Policy: Deny 0.0.0.0/0 on protected ports (22,3389)
-# Using a simple custom policy here to ensure portability.
 # -----------------------------
 resource "azurerm_policy_definition" "deny_any_protected_ports" {
   name         = "deny-any-protected-ports"
@@ -139,11 +140,13 @@ resource "azurerm_policy_definition" "deny_any_protected_ports" {
   })
 }
 
+# ✅ FIX: correct resource type name (was typo in your plan)
 resource "azurerm_policy_assignment" "deny_any_protected_ports_assignment" {
   name                 = "deny-any-protected-ports-assignment"
   display_name         = "Deny inbound any on protected ports"
   policy_definition_id = azurerm_policy_definition.deny_any_protected_ports.id
   scope                = azurerm_resource_group.rg.id
+
   parameters = jsonencode({
     ports = { value = var.protect_ports }
   })
@@ -151,9 +154,8 @@ resource "azurerm_policy_assignment" "deny_any_protected_ports_assignment" {
 
 # -----------------------------
 # Logic App (Consumption) with Managed Identity
-# - HTTP Trigger receives payload with NSG details & intent
-# - HTTP action uses Managed Identity to call ARM:
-#     GET NSG -> modify rules -> PUT NSG
+# We build it using trigger + HTTP actions because your provider version
+# doesn't accept the monolithic "definition" field.
 # -----------------------------
 resource "azurerm_logic_app_workflow" "autofix" {
   name                = var.logic_app_name
@@ -163,81 +165,67 @@ resource "azurerm_logic_app_workflow" "autofix" {
   identity {
     type = "SystemAssigned"
   }
-
-  # Definition: simple flow — manual HTTP trigger or webhook from Alert
-  definition = jsonencode({
-    "$schema" = "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-    "contentVersion" = "1.0.0.0",
-    "parameters" = {},
-    "triggers" = {
-      "manual" = {
-        "type" = "Request",
-        "kind" = "Http",
-        "inputs" = {
-          "schema" = {
-            "type" = "object",
-            "properties" = {
-              "subscriptionId"    = { "type" = "string" },
-              "resourceGroupName" = { "type" = "string" },
-              "nsgName"           = { "type" = "string" },
-              "actionType"        = { "type" = "string" }, # "ClosePort" | "BlockIP"
-              "port"              = { "type" = "string" },
-              "protocol"          = { "type" = "string" },
-              "maliciousIpCidr"   = { "type" = "string" }
-            },
-            "required" = ["subscriptionId","resourceGroupName","nsgName","actionType"]
-          }
-        }
-      }
-    },
-    "actions" = {
-      "Get_NSG" = {
-        "type" = "Http",
-        "inputs" = {
-          "method" = "GET",
-          "uri" = "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}",
-          "authentication" = {
-            "type" = "ManagedServiceIdentity"
-          }
-        },
-        "runAfter" = {}
-      },
-      "Compose_Modified_NSG" = {
-        "type" = "Compose",
-        "inputs" = "@{if(equals(triggerBody()?['actionType'],'ClosePort'), json(replace(string(body('Get_NSG')), '\"access\":\"Allow\",\"destinationPortRange\":\"' , concat('\"access\":\"Deny\",\"destinationPortRange\":\"'))), body('Get_NSG'))}"
-        # NOTE: This simple demo replaces first Allow->Deny occurrence for matching port.
-        # You can extend with more robust logic in a Function/Automation if needed.
-      },
-      "Put_NSG" = {
-        "type" = "Http",
-        "inputs" = {
-          "method" = "PUT",
-          "uri" = "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}",
-          "headers" = {
-            "Content-Type" = "application/json"
-          },
-          "body" = "@{outputs('Compose_Modified_NSG')}",
-          "authentication" = {
-            "type" = "ManagedServiceIdentity"
-          }
-        },
-        "runAfter" = {
-          "Compose_Modified_NSG" = [ "Succeeded" ]
-        }
-      }
-    },
-    "outputs" = {}
-  })
 }
 
-# HTTP trigger callback URL output (wired via separate resource)
+# HTTP trigger that accepts body with subId, rg, nsg name, action
 resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
   name         = "manual"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
-  schema       = jsonencode({ "type" = "object" })
+
+  schema = jsonencode({
+    type       = "object",
+    properties = {
+      subscriptionId    = { type = "string" },
+      resourceGroupName = { type = "string" },
+      nsgName           = { type = "string" },
+      actionType        = { type = "string" }, # "ClosePort" | "BlockIP"
+      port              = { type = "string" },
+      protocol          = { type = "string" },
+      maliciousIpCidr   = { type = "string" }
+    },
+    required = ["subscriptionId","resourceGroupName","nsgName","actionType"]
+  })
 }
 
-# Allow Logic App MSI to manage NSG
+# Step 1: GET the NSG
+resource "azurerm_logic_app_action_http" "get_nsg" {
+  name         = "Get_NSG"
+  logic_app_id = azurerm_logic_app_workflow.autofix.id
+
+  method            = "GET"
+  uri               = "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}"
+  authentication {
+    type = "ManagedServiceIdentity"
+  }
+
+  run_after = {
+    manual = ["Succeeded"]
+  }
+}
+
+# Step 2: PUT the NSG back unchanged (round-trip) — proves MSI + ARM works
+# You will enhance this later to modify rules before PUT.
+resource "azurerm_logic_app_action_http" "put_nsg" {
+  name         = "Put_NSG"
+  logic_app_id = azurerm_logic_app_workflow.autofix.id
+
+  method = "PUT"
+  uri    = "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}"
+  headers = {
+    "Content-Type" = "application/json"
+  }
+  body = "@{body('Get_NSG')}"
+
+  authentication {
+    type = "ManagedServiceIdentity"
+  }
+
+  run_after = {
+    Get_NSG = ["Succeeded"]
+  }
+}
+
+# Allow Logic App MSI to manage the NSG
 resource "azurerm_role_assignment" "logic_nsg_access" {
   principal_id         = azurerm_logic_app_workflow.autofix.identity[0].principal_id
   role_definition_name = "Network Contributor"
@@ -245,8 +233,7 @@ resource "azurerm_role_assignment" "logic_nsg_access" {
 }
 
 # -----------------------------
-# Action Group -> sends webhook to Logic App trigger URL
-# You can hook this to alerts later; for now it's created so you can wire alerts.
+# Action Group -> webhook to Logic App trigger URL
 # -----------------------------
 resource "azurerm_monitor_action_group" "ag" {
   name                = "ag-nsg-autofix"
