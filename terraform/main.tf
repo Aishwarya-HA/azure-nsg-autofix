@@ -3,7 +3,7 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "~> 3.110.0"
+      version = "~> 4.0"
     }
   }
 }
@@ -51,7 +51,6 @@ resource "azurerm_network_security_group" "nsg" {
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
 
-  # Example risky rule: RDP open to internet (we will "fix" it later)
   security_rule {
     name                       = "Allow-RDP-Internet"
     priority                   = 300
@@ -68,7 +67,6 @@ resource "azurerm_network_security_group" "nsg" {
 
 # -----------------------------
 # Network Watcher + Flow Logs v2 + Traffic Analytics
-# Create a watcher in *your* RG for the chosen region.
 # -----------------------------
 resource "azurerm_network_watcher" "nw" {
   name                = "nw-${var.location}"
@@ -85,7 +83,6 @@ resource "azurerm_network_watcher_flow_log" "flowlog" {
   enabled                   = true
   version                   = 2
 
-  # ✅ REQUIRED: retention_policy block is mandatory
   retention_policy {
     enabled = true
     days    = 7
@@ -140,12 +137,12 @@ resource "azurerm_policy_definition" "deny_any_protected_ports" {
   })
 }
 
-# ✅ FIX: correct resource type name (was typo in your plan)
-resource "azurerm_policy_assignment" "deny_any_protected_ports_assignment" {
+# ✅ v4-style: assign the policy at RG scope
+resource "azurerm_resource_group_policy_assignment" "deny_any_protected_ports_assignment" {
   name                 = "deny-any-protected-ports-assignment"
   display_name         = "Deny inbound any on protected ports"
+  resource_group_id    = azurerm_resource_group.rg.id
   policy_definition_id = azurerm_policy_definition.deny_any_protected_ports.id
-  scope                = azurerm_resource_group.rg.id
 
   parameters = jsonencode({
     ports = { value = var.protect_ports }
@@ -154,8 +151,6 @@ resource "azurerm_policy_assignment" "deny_any_protected_ports_assignment" {
 
 # -----------------------------
 # Logic App (Consumption) with Managed Identity
-# We build it using trigger + HTTP actions because your provider version
-# doesn't accept the monolithic "definition" field.
 # -----------------------------
 resource "azurerm_logic_app_workflow" "autofix" {
   name                = var.logic_app_name
@@ -167,7 +162,7 @@ resource "azurerm_logic_app_workflow" "autofix" {
   }
 }
 
-# HTTP trigger that accepts body with subId, rg, nsg name, action
+# HTTP trigger (Request)
 resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
   name         = "manual"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
@@ -178,7 +173,7 @@ resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
       subscriptionId    = { type = "string" },
       resourceGroupName = { type = "string" },
       nsgName           = { type = "string" },
-      actionType        = { type = "string" }, # "ClosePort" | "BlockIP"
+      actionType        = { type = "string" }, # "ClosePort" | "BlockIP" (for future)
       port              = { type = "string" },
       protocol          = { type = "string" },
       maliciousIpCidr   = { type = "string" }
@@ -187,45 +182,51 @@ resource "azurerm_logic_app_trigger_http_request" "la_trigger" {
   })
 }
 
-# Step 1: GET the NSG
-resource "azurerm_logic_app_action_http" "get_nsg" {
+# ---- Logic App Actions as CUSTOM so we can embed JSON, runAfter, and MSI auth ----
+
+# 1) GET the NSG
+resource "azurerm_logic_app_action_custom" "get_nsg" {
   name         = "Get_NSG"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
 
-  method            = "GET"
-  uri               = "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}"
-  authentication {
-    type = "ManagedServiceIdentity"
-  }
-
-  run_after = {
-    manual = ["Succeeded"]
-  }
+  body = jsonencode({
+    "type"   : "Http",
+    "inputs" : {
+      "method": "GET",
+      "uri"   : "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}",
+      "authentication": {
+        "type": "ManagedServiceIdentity"
+      }
+    }
+  })
 }
 
-# Step 2: PUT the NSG back unchanged (round-trip) — proves MSI + ARM works
-# You will enhance this later to modify rules before PUT.
-resource "azurerm_logic_app_action_http" "put_nsg" {
+# 2) PUT the NSG back (round-trip) — proves MSI + permissions.
+#    We'll add the real rule-fix logic in the next step.
+resource "azurerm_logic_app_action_custom" "put_nsg" {
   name         = "Put_NSG"
   logic_app_id = azurerm_logic_app_workflow.autofix.id
 
-  method = "PUT"
-  uri    = "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}"
-  headers = {
-    "Content-Type" = "application/json"
-  }
-  body = "@{body('Get_NSG')}"
-
-  authentication {
-    type = "ManagedServiceIdentity"
-  }
-
-  run_after = {
-    Get_NSG = ["Succeeded"]
-  }
+  body = jsonencode({
+    "type"   : "Http",
+    "inputs" : {
+      "method": "PUT",
+      "uri"   : "@{concat('https://management.azure.com/subscriptions/', triggerBody()?['subscriptionId'], '/resourceGroups/', triggerBody()?['resourceGroupName'], '/providers/Microsoft.Network/networkSecurityGroups/', triggerBody()?['nsgName'], '?api-version=2023-09-01')}",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "@{body('Get_NSG')}",
+      "authentication": {
+        "type": "ManagedServiceIdentity"
+      }
+    },
+    "runAfter": {
+      "Get_NSG": ["Succeeded"]
+    }
+  })
 }
 
-# Allow Logic App MSI to manage the NSG
+# Allow Logic App MI to manage the NSG
 resource "azurerm_role_assignment" "logic_nsg_access" {
   principal_id         = azurerm_logic_app_workflow.autofix.identity[0].principal_id
   role_definition_name = "Network Contributor"
@@ -233,7 +234,7 @@ resource "azurerm_role_assignment" "logic_nsg_access" {
 }
 
 # -----------------------------
-# Action Group -> webhook to Logic App trigger URL
+# Action Group -> webhook to Logic App trigger URL (ready for alerts later)
 # -----------------------------
 resource "azurerm_monitor_action_group" "ag" {
   name                = "ag-nsg-autofix"
